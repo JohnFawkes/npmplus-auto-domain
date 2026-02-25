@@ -34,13 +34,13 @@ Both modes accept --compose FILE or --scan DIR and support --dry-run.
   2. Environment vars   NPMPLUS_HOST / NPMPLUS_USER / NPMPLUS_PASS / NPMPLUS_HTTPS
   3. .env file          same NPMPLUS_* variable names (given with --env)
 
-Matching logic
---------------
-  NPMplus stores forward_host (usually the Docker container / service name).
-  A compose service matches a proxy host when the service name equals the
-  proxy host's forward_host (case-insensitive).
-  Proxy hosts whose forward_host looks like an IP address are listed as
-  unmatched after the run.
+Matching logic (--from-npm)
+--------------------------
+  NPMplus stores forward_port — the port it actually connects to.  A compose
+  service matches a proxy host when that forward_port appears on either side
+  of any entry in the service's ports: block (host/published side OR the
+  container/target side).  This works regardless of whether forward_host is
+  a service name or an IP address.
 
 --env format (original mode)
 ----------------------------
@@ -297,39 +297,42 @@ def _fetch_certs(session, api_base: str) -> dict[int, str]:
     return {c["id"]: c.get("nice_name", "") for c in r.json()}
 
 
-def npm_hosts_to_service_labels(
+def npm_hosts_to_port_labels(
     proxy_hosts: list[dict],
     certs: dict[int, str],
-) -> tuple[dict[str, dict[str, str]], list[dict]]:
+) -> dict[str, dict[str, str]]:
     """
-    Convert NPMplus proxy-host objects into the service_labels format used
-    by apply_to_compose().
+    Convert NPMplus proxy-host objects into a port → npm-labels mapping.
 
     Returns:
-        service_labels  — { forward_host_lower: { "npm.*": value, ... }, ... }
-        unmatched       — proxy host objects whose forward_host looks like an
-                          IP address (can't be matched to a compose service name)
+        { str(forward_port): { "npm.*": value, ... }, ... }
+
+    When two proxy hosts share the same forward_port the first one wins and a
+    warning is printed, because the port would be ambiguous in compose files.
     """
-    service_labels: dict[str, dict[str, str]] = {}
-    unmatched: list[dict] = []
+    port_labels: dict[str, dict[str, str]] = {}
 
     for host in proxy_hosts:
-        forward_host = (host.get("forward_host") or "").strip()
         domain_names = host.get("domain_names") or []
+        forward_port = str(host.get("forward_port") or "").strip()
 
-        if not forward_host or not domain_names:
+        if not forward_port or not domain_names:
             continue
 
-        # Detect IP addresses — these can't be matched by service name
-        import re
-        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", forward_host):
-            unmatched.append(host)
+        if forward_port in port_labels:
+            existing_domain = port_labels[forward_port].get("npm.domain", "?")
+            new_domain = domain_names[0]
+            print(
+                f"  WARNING: port {forward_port} claimed by both "
+                f"'{existing_domain}' and '{new_domain}' — keeping first",
+                file=sys.stderr,
+            )
             continue
 
         labels: dict[str, str] = {
             "npm.enable": "true",
             "npm.domain": domain_names[0],
-            "npm.port":   str(host.get("forward_port", "")),
+            "npm.port":   forward_port,
             "npm.scheme": host.get("forward_scheme") or "http",
         }
 
@@ -340,9 +343,38 @@ def npm_hosts_to_service_labels(
         if cert_id and cert_id in certs and certs[cert_id]:
             labels["npm.ssl"] = certs[cert_id]
 
-        service_labels[forward_host.lower()] = labels
+        port_labels[forward_port] = labels
 
-    return service_labels, unmatched
+    return port_labels
+
+
+def _extract_service_ports(svc_cfg: dict) -> set[str]:
+    """
+    Return all port numbers from a compose service's ports: block.
+
+    Both the published (host) side and the target (container) side are
+    included so the caller can match against whichever NPMplus uses.
+
+    Handles short syntax ("HOST:CONTAINER", "CONTAINER", "IP:HOST:CONTAINER")
+    and long syntax ({target: N, published: M, ...}).
+    """
+    ports: set[str] = set()
+    for entry in (svc_cfg.get("ports") or []):
+        if isinstance(entry, dict):
+            # Long syntax
+            if entry.get("target"):
+                ports.add(str(entry["target"]))
+            if entry.get("published"):
+                ports.add(str(entry["published"]))
+        else:
+            # Short syntax — split on ":", last segment is container port
+            raw = str(entry)
+            parts = raw.split(":")
+            # Strip /tcp or /udp suffixes and range notation
+            ports.add(parts[-1].split("/")[0].split("-")[0])
+            if len(parts) >= 2:
+                ports.add(parts[-2].split("/")[0].split("-")[0])
+    return ports
 
 
 # ---------------------------------------------------------------------------
@@ -395,9 +427,15 @@ def apply_to_compose(
     compose_path: Path,
     service_labels: dict[str, dict[str, str]],
     dry_run: bool,
+    port_labels: dict[str, dict[str, str]] | None = None,
 ) -> int:
     """
     Add/update/remove npm.* labels on matching services in *compose_path*.
+
+    When *port_labels* is provided (--from-npm mode) services are matched by
+    port number against both sides of each ports: entry.  Otherwise services
+    are matched by name against *service_labels* (--env mode).
+
     Returns the number of services that were (or would be) changed.
     """
     try:
@@ -418,9 +456,25 @@ def apply_to_compose(
     modified = 0
 
     for svc_name, svc_cfg in services_block.items():
-        desired = service_labels.get(str(svc_name).lower())
-        if not desired:
-            continue
+        if port_labels is not None:
+            # Port-based matching: find the first port this service exposes
+            # that corresponds to a known NPMplus proxy host.
+            svc_ports = _extract_service_ports(svc_cfg or {})
+            desired = None
+            matched_port = None
+            for p in sorted(svc_ports):  # sorted for determinism
+                if p in port_labels:
+                    desired = port_labels[p]
+                    matched_port = p
+                    break
+            if desired is None:
+                continue
+        else:
+            # Name-based matching (--env mode)
+            desired = service_labels.get(str(svc_name).lower())
+            matched_port = None
+            if not desired:
+                continue
 
         if svc_cfg is None:
             svc_cfg = {}
@@ -431,14 +485,16 @@ def apply_to_compose(
         removed = [k for k in current if k.startswith("npm.") and k not in desired]
 
         if not changed and not removed:
-            print(f"  {svc_name}: up-to-date")
+            port_hint = f" (port {matched_port})" if matched_port else ""
+            print(f"  {svc_name}{port_hint}: up-to-date")
             continue
 
+        port_hint = f" (matched on port {matched_port})" if matched_port else ""
         for k, v in sorted(changed.items()):
             old = current.get(k, "<not set>")
-            print(f"  {svc_name}: {k}  {old!r} → {v!r}")
+            print(f"  {svc_name}{port_hint}: {k}  {old!r} → {v!r}")
         for k in sorted(removed):
-            print(f"  {svc_name}: {k}  {current[k]!r} → <removed>")
+            print(f"  {svc_name}{port_hint}: {k}  {current[k]!r} → <removed>")
 
         if not dry_run:
             _write_labels(svc_cfg, current, desired)
@@ -560,19 +616,13 @@ def main() -> None:
         certs = _fetch_certs(session, api_base)
         print(f"  {len(certs)} certificate(s) found\n")
 
-        service_labels, unmatched = npm_hosts_to_service_labels(proxy_hosts, certs)
-        print(f"Proxy hosts matchable by service name: {len(service_labels)}")
-        for fwd_host, labels in sorted(service_labels.items()):
-            print(f"  {fwd_host:30s}  →  {labels.get('npm.domain', '?')}")
+        port_labels = npm_hosts_to_port_labels(proxy_hosts, certs)
+        print(f"Port → domain mapping from NPMplus ({len(port_labels)} entries):")
+        for port, labels in sorted(port_labels.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+            print(f"  :{port:<6}  →  {labels.get('npm.domain', '?')}")
 
-        if unmatched:
-            print(f"\nProxy hosts with IP forward_host (skipped — cannot match to a service name):")
-            for h in unmatched:
-                domains = ", ".join(h.get("domain_names") or [])
-                print(f"  {h.get('forward_host')}  ({domains})")
-
-        if not service_labels:
-            print("\nNo matchable proxy hosts — nothing to do.")
+        if not port_labels:
+            print("\nNo proxy hosts with a forward_port — nothing to do.")
             sys.exit(0)
 
     # ── --env mode ───────────────────────────────────────────────────────────
@@ -598,7 +648,10 @@ def main() -> None:
     total = 0
     for cf in compose_files:
         print(f"{cf}:")
-        total += apply_to_compose(cf, service_labels, dry_run=args.dry_run)
+        if args.from_npm:
+            total += apply_to_compose(cf, {}, dry_run=args.dry_run, port_labels=port_labels)
+        else:
+            total += apply_to_compose(cf, service_labels, dry_run=args.dry_run)
         print()
 
     action = "would be modified" if args.dry_run else "modified"
