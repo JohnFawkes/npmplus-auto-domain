@@ -21,6 +21,8 @@ Add these labels to any container you want NPMplus to proxy:
 | `npm.scheme` | no | `http` | Forward scheme: `http` or `https` |
 | `npm.ip` | no | — | Forward to this IP or hostname verbatim. Overrides all other forward-host logic. Useful when the container runs with `network_mode: host` and you need NPMplus to forward to the host IP (e.g. `192.168.1.10`) |
 | `npm.containername` | no | `true` | Set to `false` to forward to the container's auto-detected Docker bridge IP instead of its name. Useful when NPMplus uses `network_mode: host` but the target container is on a bridge network |
+| `npm.ssl` | no | — | SSL certificate to attach to the proxy host. Set to `create` to request a new Let's Encrypt certificate for the domain, or set to the exact certificate name shown in the NPMplus UI to use an existing certificate |
+| `npm.force_https` | no | `false` | Set to `true` to add an HTTP→HTTPS redirect on the proxy host |
 
 ### Port auto-detection
 
@@ -31,7 +33,7 @@ When `npm.port` is not set the watcher uses the following priority order:
 
 If no port can be determined the container is skipped and a warning is logged. Set `npm.port` explicitly to avoid ambiguity.
 
-### Example — docker run
+### Example — docker run (with Let's Encrypt SSL)
 
 ```bash
 docker run -d \
@@ -40,10 +42,12 @@ docker run -d \
   --label npm.domain=app.example.com \
   --label npm.port=3000 \
   --label npm.scheme=http \
+  --label npm.ssl=create \
+  --label npm.force_https=true \
   myimage
 ```
 
-### Example — docker-compose service
+### Example — docker-compose service (existing certificate by name)
 
 ```yaml
 services:
@@ -52,8 +56,10 @@ services:
     labels:
       npm.enable: "true"
       npm.domain: "app.example.com"
-      npm.port: "3000"       # optional
-      npm.scheme: "http"     # optional
+      npm.port: "3000"                    # optional
+      npm.scheme: "http"                  # optional
+      npm.ssl: "*.example.com"            # name shown in NPMplus UI
+      npm.force_https: "true"             # optional
 ```
 
 ---
@@ -102,6 +108,7 @@ The watcher will:
 | `NPMPLUS_USER` | **yes** | — | NPMplus admin e-mail address |
 | `NPMPLUS_PASS` | **yes** | — | NPMplus admin password |
 | `NPMPLUS_HTTPS` | no | `false` | Set `true` if NPMplus is only reachable over HTTPS. Self-signed certificates are accepted |
+| `LETSENCRYPT_EMAIL` | no | `NPMPLUS_USER` | E-mail address used for Let's Encrypt registration when `npm.ssl=create`. Defaults to the value of `NPMPLUS_USER` |
 | `CLEANUP_ON_STOP` | no | `true` | Delete proxy hosts when a container stops. Set `false` to keep them alive across restarts |
 | `LOG_LEVEL` | no | `INFO` | Logging verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 

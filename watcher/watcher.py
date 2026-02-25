@@ -6,10 +6,13 @@ Watches Docker container labels and automatically manages proxy hosts
 in NPMplus (Nginx Proxy Manager Plus).
 
 Labels watched on containers:
-  npm.enable  - Set to "true" / "1" / "yes" to enable auto-proxying
-  npm.domain  - Domain name for the proxy (required when npm.enable is set)
-  npm.port    - Port to forward to (optional; auto-detected from ExposedPorts)
-  npm.scheme  - Forward scheme: "http" or "https" (optional; defaults to "http")
+  npm.enable        - Set to "true" / "1" / "yes" to enable auto-proxying
+  npm.domain        - Domain name for the proxy (required when npm.enable is set)
+  npm.port          - Port to forward to (optional; auto-detected from ExposedPorts)
+  npm.scheme        - Forward scheme: "http" or "https" (optional; defaults to "http")
+  npm.ssl           - SSL certificate: "create" to request a new Let's Encrypt cert,
+                      or the exact name shown in the NPMplus UI for an existing cert
+  npm.force_https   - Set to "true" to add an HTTP→HTTPS redirect on the proxy host
 
 Required environment variables:
   NPMPLUS_HOST  - NPMplus host, e.g. "192.168.1.10:81" or "npm.example.com"
@@ -18,6 +21,8 @@ Required environment variables:
 
 Optional environment variables:
   NPMPLUS_HTTPS      - Use HTTPS to reach NPMplus API (default: false)
+  LETSENCRYPT_EMAIL  - E-mail for Let's Encrypt registration when npm.ssl=create
+                       (defaults to NPMPLUS_USER)
   DOCKER_HOST        - Docker socket-proxy URL (default: tcp://socket-proxy:2375)
   CLEANUP_ON_STOP    - Delete proxy hosts when a container stops (default: true)
   LOG_LEVEL          - Logging level: DEBUG / INFO / WARNING / ERROR (default: INFO)
@@ -59,6 +64,9 @@ NPMPLUS_PASS = os.environ.get("NPMPLUS_PASS", "").strip()
 NPMPLUS_HTTPS = os.environ.get("NPMPLUS_HTTPS", "false").lower() in ("true", "1", "yes")
 DOCKER_HOST = os.environ.get("DOCKER_HOST", "tcp://socket-proxy:2375")
 CLEANUP_ON_STOP = os.environ.get("CLEANUP_ON_STOP", "true").lower() in ("true", "1", "yes")
+# E-mail used for Let's Encrypt registration when npm.ssl=create.
+# Falls back to NPMPLUS_USER (which is already an e-mail address).
+LETSENCRYPT_EMAIL = os.environ.get("LETSENCRYPT_EMAIL", "").strip() or NPMPLUS_USER
 STATE_FILE = "/data/state.json"
 
 # Validate required config
@@ -178,11 +186,11 @@ def _npm_api(method: str, path: str, _retry: bool = True, **kwargs) -> Optional[
     session = _ensure_auth()
     if not session:
         return None
+    kwargs.setdefault("timeout", 15)
     try:
         r = session.request(
             method,
             f"{NPMPLUS_API}{path}",
-            timeout=15,
             **kwargs,
         )
         if r.status_code == 401 and _retry:
@@ -206,24 +214,36 @@ def _find_proxy_host(domain: str) -> Optional[dict]:
     return None
 
 
-def _create_proxy_host(domain: str, forward_host: str, forward_port: int, scheme: str = "http") -> Optional[int]:
+def _create_proxy_host(
+    domain: str,
+    forward_host: str,
+    forward_port: int,
+    scheme: str = "http",
+    ssl_forced: bool = False,
+    certificate_id: Optional[int] = None,
+) -> Optional[int]:
     """Create a proxy host in NPMplus. Returns the new host id on success."""
     payload = {
         "domain_names": [domain],
         "forward_scheme": scheme,
         "forward_host": forward_host,
         "forward_port": forward_port,
+        "ssl_forced": ssl_forced,
     }
+    if certificate_id is not None:
+        payload["certificate_id"] = certificate_id
     r = _npm_api("POST", "/nginx/proxy-hosts", json=payload)
     if r and r.status_code == 201:
         host_id = r.json().get("id")
         log.info(
-            "Created proxy host: %s -> %s://%s:%d  (id=%s)",
+            "Created proxy host: %s -> %s://%s:%d  (id=%s, ssl_forced=%s, cert_id=%s)",
             domain,
             scheme,
             forward_host,
             forward_port,
             host_id,
+            ssl_forced,
+            certificate_id,
         )
         return host_id
     if r:
@@ -240,6 +260,55 @@ def _delete_proxy_host(host_id: int) -> bool:
     if r:
         log.error("Failed to delete proxy host id=%d: %s %s", host_id, r.status_code, r.text)
     return False
+
+
+def _find_certificate_by_name(name: str) -> Optional[int]:
+    """Look up an NPMplus certificate by its nice_name. Returns cert id or None."""
+    r = _npm_api("GET", "/nginx/certificates")
+    if r and r.status_code == 200:
+        for cert in r.json():
+            if cert.get("nice_name", "") == name:
+                return cert.get("id")
+        log.warning("No certificate named '%s' found in NPMplus", name)
+    return None
+
+
+def _create_certificate(domain: str) -> Optional[int]:
+    """Request a new Let's Encrypt certificate for *domain* via NPMplus.
+
+    Uses LETSENCRYPT_EMAIL for the LE registration address.
+    The API call may block for ~30-60 s while NPMplus completes the ACME
+    challenge, so a longer timeout (120 s) is used.
+    Returns the new certificate id on success, or None on failure.
+    """
+    payload = {
+        "domain_names": [domain],
+        "meta": {
+            "letsencrypt_email": LETSENCRYPT_EMAIL,
+            "letsencrypt_agree": True,
+            "dns_challenge": False,
+        },
+        "provider": "letsencrypt",
+    }
+    r = _npm_api("POST", "/nginx/certificates", json=payload, timeout=120)
+    if r and r.status_code == 201:
+        cert_id = r.json().get("id")
+        log.info("Created Let's Encrypt certificate for %s (id=%s)", domain, cert_id)
+        return cert_id
+    if r:
+        log.error("Failed to create certificate for %s: %s %s", domain, r.status_code, r.text)
+    return None
+
+
+def _resolve_certificate_id(domain: str, ssl_label: str) -> Optional[int]:
+    """Resolve the npm.ssl label to an NPMplus certificate id.
+
+    - "create"       → request a new Let's Encrypt certificate for *domain*
+    - anything else  → look up an existing certificate by nice_name
+    """
+    if ssl_label.lower() == "create":
+        return _create_certificate(domain)
+    return _find_certificate_by_name(ssl_label)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +448,21 @@ def _handle_start(container_id: str, client: docker.DockerClient) -> None:
         log.warning("[%s] Could not determine forward_host, skipping", container.name)
         return
 
+    # SSL certificate
+    ssl_label = labels.get("npm.ssl", "").strip()
+    certificate_id: Optional[int] = None
+    if ssl_label:
+        certificate_id = _resolve_certificate_id(domain, ssl_label)
+        if certificate_id is None:
+            log.warning(
+                "[%s] Could not resolve SSL certificate '%s' — creating proxy host without SSL",
+                container.name,
+                ssl_label,
+            )
+
+    # Force HTTPS redirect
+    force_https = labels.get("npm.force_https", "").lower() in ("true", "1", "yes")
+
     # Already tracked (e.g. watcher restarted or duplicate event)
     if container_id in _state:
         log.debug("[%s] Already tracked (proxy id=%d)", container.name, _state[container_id])
@@ -398,7 +482,11 @@ def _handle_start(container_id: str, client: docker.DockerClient) -> None:
         return
 
     # Create the proxy host
-    host_id = _create_proxy_host(domain, forward_host, port, scheme)
+    host_id = _create_proxy_host(
+        domain, forward_host, port, scheme,
+        ssl_forced=force_https,
+        certificate_id=certificate_id,
+    )
     if host_id:
         _state[container_id] = host_id
         _save_state()
