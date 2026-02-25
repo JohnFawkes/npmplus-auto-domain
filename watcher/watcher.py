@@ -102,26 +102,34 @@ def _save_state() -> None:
 
 
 # ---------------------------------------------------------------------------
-# NPMplus API helpers
+# NPMplus API helpers — cookie-based session authentication
+#
+# NPMplus authenticates exclusively via an httpOnly cookie named "token".
+# The POST /api/tokens response body contains only {"expires": "<ISO8601>"},
+# the actual JWT is delivered as a Set-Cookie header.  We use a
+# requests.Session so that cookie is sent automatically on every request.
 # ---------------------------------------------------------------------------
-_token: Optional[str] = None
-_token_expires: float = 0.0
+_npm_session: Optional[requests.Session] = None
+_session_expires: float = 0.0
 
 
-def _get_token() -> Optional[str]:
-    """Return a valid NPMplus bearer token, refreshing if necessary."""
-    global _token, _token_expires, NPMPLUS_API
-    if _token and time.time() < _token_expires - 60:
-        return _token
+def _ensure_auth() -> Optional[requests.Session]:
+    """Return an authenticated requests.Session, re-logging-in if expired."""
+    global _npm_session, _session_expires, NPMPLUS_API
+
+    if _npm_session and time.time() < _session_expires - 60:
+        return _npm_session
+
+    session = requests.Session()
+    session.verify = False  # accept self-signed certificates
+
     try:
-        url = f"{NPMPLUS_API}/tokens"
-        # Disable automatic redirects so a 301 HTTP→HTTPS doesn't silently
-        # convert our POST into a GET (standard requests/browser behaviour).
-        r = requests.post(
-            url,
+        # Disable automatic redirects so a 301/308 HTTP→HTTPS redirect does
+        # not silently convert our POST to a GET (standard browser behaviour).
+        r = session.post(
+            f"{NPMPLUS_API}/tokens",
             json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS},
             timeout=15,
-            verify=False,
             allow_redirects=False,
         )
         # Auto-upgrade to HTTPS when the server issues a redirect
@@ -130,44 +138,57 @@ def _get_token() -> Optional[str]:
             if location.startswith("https://"):
                 log.info("NPMplus redirected to HTTPS — upgrading API base URL")
                 NPMPLUS_API = NPMPLUS_API.replace("http://", "https://", 1)
-                r = requests.post(
+                r = session.post(
                     f"{NPMPLUS_API}/tokens",
                     json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS},
                     timeout=15,
-                    verify=False,
                 )
             else:
-                # Unexpected redirect — follow it normally and let raise_for_status catch errors
-                r = requests.post(location, json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS}, timeout=15, verify=False)
+                r = session.post(
+                    location,
+                    json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS},
+                    timeout=15,
+                )
         r.raise_for_status()
-        _token = r.json()["token"]
-        _token_expires = time.time() + 86400  # tokens are valid for 1 day
-        log.info("Authenticated with NPMplus")
-        return _token
+
+        # Response body: {"expires": "2026-02-26T05:52:51.000Z"}
+        # The token itself is in the Set-Cookie header (httpOnly, path=/api).
+        body = r.json()
+        expires_str = body.get("expires", "")
+        if expires_str:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+                _session_expires = dt.timestamp()
+            except Exception:
+                _session_expires = time.time() + 86400
+        else:
+            _session_expires = time.time() + 86400
+
+        _npm_session = session
+        log.info("Authenticated with NPMplus (session cookie acquired)")
+        return session
     except Exception as exc:
         log.error("NPMplus authentication failed: %s", exc)
-        _token = None
         return None
 
 
 def _npm_api(method: str, path: str, _retry: bool = True, **kwargs) -> Optional[requests.Response]:
     """Make an authenticated request to the NPMplus API."""
-    token = _get_token()
-    if not token:
+    session = _ensure_auth()
+    if not session:
         return None
     try:
-        r = requests.request(
+        r = session.request(
             method,
             f"{NPMPLUS_API}{path}",
-            headers={"Authorization": f"Bearer {token}"},
             timeout=15,
-            verify=False,
             **kwargs,
         )
         if r.status_code == 401 and _retry:
-            # Token may have been invalidated server-side; force a refresh
-            global _token
-            _token = None
+            # Session may have been invalidated server-side; force re-auth
+            global _npm_session
+            _npm_session = None
             return _npm_api(method, path, _retry=False, **kwargs)
         return r
     except Exception as exc:
@@ -402,7 +423,7 @@ def main() -> None:
 
     # Wait until NPMplus is reachable and credentials work
     backoff = 5
-    while not _get_token():
+    while not _ensure_auth():
         log.warning("NPMplus not ready — retrying in %ds …", backoff)
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
