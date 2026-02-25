@@ -350,28 +350,27 @@ def npm_hosts_to_port_labels(
 
 def _extract_service_ports(svc_cfg: dict) -> set[str]:
     """
-    Return all port numbers from a compose service's ports: block.
+    Return the published (host/left-side) port numbers from a compose
+    service's ports: block.
 
-    Both the published (host) side and the target (container) side are
-    included so the caller can match against whichever NPMplus uses.
+    Only the host-side port is returned because that is what NPMplus's
+    forward_port refers to when routing via the host address.
 
-    Handles short syntax ("HOST:CONTAINER", "CONTAINER", "IP:HOST:CONTAINER")
-    and long syntax ({target: N, published: M, ...}).
+    Handles short syntax ("HOST:CONTAINER", "IP:HOST:CONTAINER") and long
+    syntax ({target: N, published: M, ...}).  Entries with no explicit host
+    port (bare "CONTAINER" with no colon) are skipped.
     """
     ports: set[str] = set()
     for entry in (svc_cfg.get("ports") or []):
         if isinstance(entry, dict):
-            # Long syntax
-            if entry.get("target"):
-                ports.add(str(entry["target"]))
+            # Long syntax — only use 'published' (the host side)
             if entry.get("published"):
-                ports.add(str(entry["published"]))
+                ports.add(str(entry["published"]).split("-")[0])
         else:
-            # Short syntax — split on ":", last segment is container port
-            raw = str(entry)
-            parts = raw.split(":")
-            # Strip /tcp or /udp suffixes and range notation
-            ports.add(parts[-1].split("/")[0].split("-")[0])
+            # Short syntax: "HOST:CONTAINER" or "IP:HOST:CONTAINER"
+            # parts[-2] is the host port; parts[-1] is the container port.
+            # If there is no colon there is no explicit host port — skip.
+            parts = str(entry).split(":")
             if len(parts) >= 2:
                 ports.add(parts[-2].split("/")[0].split("-")[0])
     return ports
