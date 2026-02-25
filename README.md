@@ -1,1 +1,199 @@
-# npmplus-auto-domain
+# NPMplus Auto Domain
+
+Automatically create and remove [NPMplus](https://github.com/ZoeyVid/NPMplus) proxy hosts by reading Docker container labels. When a labelled container starts, a proxy host is registered in NPMplus. When the container stops, the proxy host is cleaned up.
+
+The watcher connects to Docker through [tecnativa/docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) so the raw Docker socket is never exposed inside the watcher container.
+
+---
+
+## Labels
+
+Add these labels to any container you want NPMplus to proxy:
+
+| Label | Required | Default | Description |
+|---|---|---|---|
+| `npm.enable` | yes | — | Set to `true` to enable auto-proxying for this container |
+| `npm.domain` | yes | — | Domain name to register in NPMplus (e.g. `app.example.com`) |
+| `npm.port` | no | auto | Port the container listens on. Auto-detected from `ExposedPorts` if omitted |
+| `npm.scheme` | no | `http` | Forward scheme: `http` or `https` |
+
+### Port auto-detection
+
+When `npm.port` is not set the watcher uses the following priority order:
+
+1. Lowest port declared in the container image's `ExposedPorts` (the container's own listening port, reachable via Docker internal DNS)
+2. First host-mapped port from the container's port bindings (useful when NPMplus is outside Docker)
+
+If no port can be determined the container is skipped and a warning is logged. Set `npm.port` explicitly to avoid ambiguity.
+
+### Example — docker run
+
+```bash
+docker run -d \
+  --name myapp \
+  --label npm.enable=true \
+  --label npm.domain=app.example.com \
+  --label npm.port=3000 \
+  --label npm.scheme=http \
+  myimage
+```
+
+### Example — docker-compose service
+
+```yaml
+services:
+  myapp:
+    image: myimage
+    labels:
+      npm.enable: "true"
+      npm.domain: "app.example.com"
+      npm.port: "3000"       # optional
+      npm.scheme: "http"     # optional
+```
+
+---
+
+## Quick start
+
+### 1. Clone this repository
+
+```bash
+git clone https://github.com/your-org/npmplus-auto-domain.git
+cd npmplus-auto-domain
+```
+
+### 2. Create your `.env` file
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in at minimum:
+
+```dotenv
+NPMPLUS_HOST=192.168.1.10:81   # IP:port or domain of your NPMplus instance
+NPMPLUS_USER=admin@example.com
+NPMPLUS_PASS=yourpassword
+```
+
+### 3. Start the watcher
+
+```bash
+docker compose up -d
+```
+
+The watcher will:
+- Scan all running containers immediately on startup
+- Listen for `start` / `stop` / `die` events and react in real time
+- Persist its state in a named volume so it survives restarts
+
+---
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `NPMPLUS_HOST` | **yes** | — | Host (and optional port) of NPMplus, **without** scheme. E.g. `192.168.1.10:81` or `npm.example.com` |
+| `NPMPLUS_USER` | **yes** | — | NPMplus admin e-mail address |
+| `NPMPLUS_PASS` | **yes** | — | NPMplus admin password |
+| `NPMPLUS_HTTPS` | no | `false` | Set `true` if NPMplus is only reachable over HTTPS. Self-signed certificates are accepted |
+| `CLEANUP_ON_STOP` | no | `true` | Delete proxy hosts when a container stops. Set `false` to keep them alive across restarts |
+| `LOG_LEVEL` | no | `INFO` | Logging verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
+
+---
+
+## Networking
+
+### NPMplus must be able to reach the monitored containers
+
+The `forward_host` written to NPMplus is the **container name** (Docker internal DNS). This means:
+
+- NPMplus and the target container must share at least one Docker network, **or**
+- You use port mappings (host ports) and NPMplus forwards to the Docker host IP
+
+The recommended setup is to attach both NPMplus and your application containers to a shared Docker network and add that network to the `npm-watcher` service in `docker-compose.yml`.
+
+### The watcher only needs to reach the socket proxy and NPMplus
+
+The watcher does **not** need to be on the same network as your application containers. It only needs:
+
+1. `watcher-net` — to talk to the socket proxy
+2. A path to the NPMplus API — add the NPMplus network to the `npm-watcher` service if needed
+
+### Example — shared network with NPMplus
+
+```yaml
+# In your application's docker-compose.yml
+services:
+  myapp:
+    image: myimage
+    networks:
+      - proxy          # shared with NPMplus
+    labels:
+      npm.enable: "true"
+      npm.domain: "app.example.com"
+
+networks:
+  proxy:
+    external: true     # created by the NPMplus stack
+```
+
+```yaml
+# In npmplus-auto-domain/docker-compose.yml — add to npm-watcher:
+    networks:
+      - watcher-net
+      - proxy          # so the watcher can reach NPMplus on this network
+
+networks:
+  watcher-net:
+    driver: bridge
+  proxy:
+    external: true
+```
+
+---
+
+## Architecture
+
+```
++---------------------+        +--------------------------+
+|   Docker daemon      |<------| tecnativa/docker-socket  |
+| /var/run/docker.sock | (ro)  |        -proxy            |
++---------------------+        +----------+---------------+
+                                           | tcp://socket-proxy:2375
+                                +----------v---------------+
+                                |      npm-watcher         |
+                                | (watches labels &        |
+                                |  manages NPMplus API)    |
+                                +----------+---------------+
+                                           | HTTP(S) /api/...
+                                +----------v---------------+
+                                |         NPMplus          |
+                                | (Nginx Proxy Manager +)  |
+                                +--------------------------+
+```
+
+### State persistence
+
+The watcher stores a `container_id → proxy_host_id` mapping in `/data/state.json` (backed by a named Docker volume). On restart it:
+
+1. Loads the saved state
+2. Removes entries for containers that no longer exist (and deletes their proxy hosts if `CLEANUP_ON_STOP=true`)
+3. Scans all running containers to pick up anything started while it was offline
+4. Resumes listening for events
+
+---
+
+## Building from source
+
+```bash
+docker compose build
+```
+
+---
+
+## Viewing logs
+
+```bash
+docker compose logs -f npm-watcher
+```

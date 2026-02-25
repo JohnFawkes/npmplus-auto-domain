@@ -1,0 +1,82 @@
+services:
+
+  # -----------------------------------------------------------------------
+  # Secure Docker socket proxy — only exposes the API events and
+  # container-read endpoints needed by the watcher.
+  # Never mount the raw Docker socket into the watcher container directly.
+  # -----------------------------------------------------------------------
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: npm-socket-proxy
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Allow read-only access to container inspect and event streams
+      CONTAINERS: 1  # GET /containers/*
+      EVENTS: 1      # GET /events
+      NETWORKS: 1    # GET /networks/* (used for container IP lookup)
+      # Everything else is denied by default
+    networks:
+      - watcher-net
+
+  # -----------------------------------------------------------------------
+  # NPMplus Auto Domain Watcher
+  # -----------------------------------------------------------------------
+  npm-watcher:
+    build:
+      context: ./watcher
+    image: npm-watcher:latest
+    container_name: npm-watcher
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    environment:
+      # ------------------------------------------------------------------
+      # Required — NPMplus connection
+      # ------------------------------------------------------------------
+
+      # Host and port (or domain) of your NPMplus instance, without scheme.
+      # Examples:  192.168.1.10:81   npm.yourdomain.com   npm.yourdomain.com:81
+      NPMPLUS_HOST: ${NPMPLUS_HOST}
+
+      # NPMplus admin credentials
+      NPMPLUS_USER: ${NPMPLUS_USER}
+      NPMPLUS_PASS: ${NPMPLUS_PASS}
+
+      # ------------------------------------------------------------------
+      # Optional
+      # ------------------------------------------------------------------
+
+      # Set to "true" if your NPMplus is only accessible over HTTPS.
+      # Self-signed certificates are accepted automatically.
+      # Default: false
+      NPMPLUS_HTTPS: ${NPMPLUS_HTTPS:-false}
+
+      # Delete proxy hosts from NPMplus when a container stops or dies.
+      # Set to "false" to keep proxy hosts alive even when containers stop
+      # (they will be re-associated when the container restarts).
+      # Default: true
+      CLEANUP_ON_STOP: ${CLEANUP_ON_STOP:-true}
+
+      # Log verbosity: DEBUG | INFO | WARNING | ERROR
+      # Default: INFO
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # Internal — point the Docker SDK at the socket proxy
+      DOCKER_HOST: tcp://socket-proxy:2375
+    volumes:
+      # Persists the container_id -> proxy_host_id mapping across restarts
+      - npm-watcher-data:/data
+    networks:
+      - watcher-net
+      # Add additional networks here if the watcher needs to reach NPMplus
+      # through a specific Docker network, e.g.:
+      # - npmplus-net
+
+volumes:
+  npm-watcher-data:
+
+networks:
+  watcher-net:
+    driver: bridge
