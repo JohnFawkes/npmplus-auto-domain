@@ -400,7 +400,11 @@ def apply_to_compose(
     Add/update/remove npm.* labels on matching services in *compose_path*.
     Returns the number of services that were (or would be) changed.
     """
-    yml_engine, data = _load_yaml(compose_path)
+    try:
+        yml_engine, data = _load_yaml(compose_path)
+    except Exception as exc:
+        print(f"  SKIP — YAML parse error: {exc}", file=sys.stderr)
+        return 0
 
     if not isinstance(data, dict):
         print("  SKIP — not a valid YAML mapping", file=sys.stderr)
