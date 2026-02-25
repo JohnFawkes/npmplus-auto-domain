@@ -262,6 +262,58 @@ def _delete_proxy_host(host_id: int) -> bool:
     return False
 
 
+def _proxy_host_matches(
+    existing: dict,
+    forward_host: str,
+    forward_port: int,
+    scheme: str,
+    ssl_forced: bool,
+    certificate_id: Optional[int],
+) -> bool:
+    """Return True when the NPMplus proxy-host already reflects all desired values."""
+    # NPMplus stores "no certificate" as 0; normalise both sides to None.
+    existing_cert = existing.get("certificate_id") or None
+    desired_cert = certificate_id or None
+    return (
+        existing.get("forward_host") == forward_host
+        and int(existing.get("forward_port", 0)) == forward_port
+        and existing.get("forward_scheme") == scheme
+        and bool(existing.get("ssl_forced")) == ssl_forced
+        and existing_cert == desired_cert
+    )
+
+
+def _update_proxy_host(
+    host_id: int,
+    domain: str,
+    forward_host: str,
+    forward_port: int,
+    scheme: str = "http",
+    ssl_forced: bool = False,
+    certificate_id: Optional[int] = None,
+) -> bool:
+    """Update an existing proxy host in NPMplus. Returns True on success."""
+    payload = {
+        "domain_names": [domain],
+        "forward_scheme": scheme,
+        "forward_host": forward_host,
+        "forward_port": forward_port,
+        "ssl_forced": ssl_forced,
+    }
+    if certificate_id is not None:
+        payload["certificate_id"] = certificate_id
+    r = _npm_api("PUT", f"/nginx/proxy-hosts/{host_id}", json=payload)
+    if r and r.status_code == 200:
+        log.info(
+            "Updated proxy host id=%d: %s -> %s://%s:%d  (ssl_forced=%s, cert_id=%s)",
+            host_id, domain, scheme, forward_host, forward_port, ssl_forced, certificate_id,
+        )
+        return True
+    if r:
+        log.error("Failed to update proxy host id=%d: %s %s", host_id, r.status_code, r.text)
+    return False
+
+
 def _find_certificate_by_name(name: str) -> Optional[int]:
     """Look up an NPMplus certificate by its nice_name. Returns cert id or None."""
     r = _npm_api("GET", "/nginx/certificates")
@@ -471,13 +523,23 @@ def _handle_start(container_id: str, client: docker.DockerClient) -> None:
     # Domain already registered in NPMplus (e.g. another container, or leftover)
     existing = _find_proxy_host(domain)
     if existing:
-        log.info(
-            "[%s] Domain %s already exists in NPMplus (id=%d) — associating",
-            container.name,
-            domain,
-            existing["id"],
-        )
-        _state[container_id] = existing["id"]
+        host_id = existing["id"]
+        if _proxy_host_matches(existing, forward_host, port, scheme, force_https, certificate_id):
+            log.info(
+                "[%s] Domain %s already exists in NPMplus (id=%d) — labels match, no update needed",
+                container.name, domain, host_id,
+            )
+        else:
+            log.info(
+                "[%s] Domain %s already exists in NPMplus (id=%d) — labels differ, updating",
+                container.name, domain, host_id,
+            )
+            _update_proxy_host(
+                host_id, domain, forward_host, port, scheme,
+                ssl_forced=force_https,
+                certificate_id=certificate_id,
+            )
+        _state[container_id] = host_id
         _save_state()
         return
 
