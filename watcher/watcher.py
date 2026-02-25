@@ -277,13 +277,53 @@ def _detect_port(container) -> Optional[int]:
     return None
 
 
-def _forward_host(container) -> str:
-    """
-    Return the hostname NPMplus should forward to.
+def _container_ip(container) -> Optional[str]:
+    """Return the first Docker bridge IP for the container, or None."""
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks") or {}
+    for net_config in networks.values():
+        ip = net_config.get("IPAddress", "")
+        if ip:
+            return ip
+    return None
 
-    Uses the container name (Docker internal DNS).  This requires NPMplus and
-    the target container to be connected to a shared Docker network.
+
+def _forward_host(container) -> Optional[str]:
     """
+    Determine the forward host NPMplus should proxy to, via container labels.
+
+    Priority:
+      1. npm.ip=<value>         — use this value verbatim as the forward host.
+                                  Lets you point NPMplus at the Docker host IP
+                                  (e.g. 192.168.1.10) for containers that run
+                                  with network_mode: host.
+      2. npm.containername=false — use the container's Docker bridge IP
+                                  (auto-detected from NetworkSettings).
+                                  Useful when NPMplus is on host-mode and the
+                                  target container is on a bridge network.
+      3. default                 — use the Docker container name (Docker
+                                  internal DNS).  Requires NPMplus and the
+                                  target container to share a Docker network.
+    """
+    labels = container.labels
+
+    # 1. Explicit IP / host override
+    custom_ip = labels.get("npm.ip", "").strip()
+    if custom_ip:
+        log.debug("[%s] Using npm.ip label: %s", container.name, custom_ip)
+        return custom_ip
+
+    # 2. Auto-detected container bridge IP
+    use_name = labels.get("npm.containername", "true").lower() not in ("false", "0", "no")
+    if not use_name:
+        ip = _container_ip(container)
+        if not ip:
+            log.warning(
+                "[%s] npm.containername=false but no Docker bridge IP found",
+                container.name,
+            )
+        return ip
+
+    # 3. Default — container name via Docker internal DNS
     return container.name.lstrip("/")
 
 
@@ -335,6 +375,9 @@ def _handle_start(container_id: str, client: docker.DockerClient) -> None:
         return
 
     forward_host = _forward_host(container)
+    if not forward_host:
+        log.warning("[%s] Could not determine forward_host, skipping", container.name)
+        return
 
     # Already tracked (e.g. watcher restarted or duplicate event)
     if container_id in _state:
