@@ -68,7 +68,7 @@ if _missing:
     sys.exit(1)
 
 _scheme = "https" if NPMPLUS_HTTPS else "http"
-NPMPLUS_API = f"{_scheme}://{NPMPLUS_HOST}/api"
+NPMPLUS_API = f"{_scheme}://{NPMPLUS_HOST}/api"  # may be upgraded to https at runtime
 
 log.info("NPMplus API: %s", NPMPLUS_API)
 log.info("Docker host: %s", DOCKER_HOST)
@@ -110,16 +110,35 @@ _token_expires: float = 0.0
 
 def _get_token() -> Optional[str]:
     """Return a valid NPMplus bearer token, refreshing if necessary."""
-    global _token, _token_expires
+    global _token, _token_expires, NPMPLUS_API
     if _token and time.time() < _token_expires - 60:
         return _token
     try:
+        url = f"{NPMPLUS_API}/tokens"
+        # Disable automatic redirects so a 301 HTTP→HTTPS doesn't silently
+        # convert our POST into a GET (standard requests/browser behaviour).
         r = requests.post(
-            f"{NPMPLUS_API}/tokens",
+            url,
             json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS},
             timeout=15,
             verify=False,
+            allow_redirects=False,
         )
+        # Auto-upgrade to HTTPS when the server issues a redirect
+        if r.status_code in (301, 302, 307, 308):
+            location = r.headers.get("Location", "")
+            if location.startswith("https://"):
+                log.info("NPMplus redirected to HTTPS — upgrading API base URL")
+                NPMPLUS_API = NPMPLUS_API.replace("http://", "https://", 1)
+                r = requests.post(
+                    f"{NPMPLUS_API}/tokens",
+                    json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS},
+                    timeout=15,
+                    verify=False,
+                )
+            else:
+                # Unexpected redirect — follow it normally and let raise_for_status catch errors
+                r = requests.post(location, json={"identity": NPMPLUS_USER, "secret": NPMPLUS_PASS}, timeout=15, verify=False)
         r.raise_for_status()
         _token = r.json()["token"]
         _token_expires = time.time() + 86400  # tokens are valid for 1 day
