@@ -16,6 +16,8 @@ Add these labels to any container you want NPMplus to proxy:
 | `npm.domain` | yes | — | Domain name to register in NPMplus (e.g. `app.example.com`) |
 | `npm.port` | no | auto | Port the container listens on. Auto-detected from `ExposedPorts` if omitted |
 | `npm.scheme` | no | `http` | Forward scheme: `http` or `https` |
+| `npm.ip` | no | — | Forward to this IP or hostname verbatim. Overrides all other forward-host logic. Useful when the container runs with `network_mode: host` and you need NPMplus to forward to the host IP (e.g. `192.168.1.10`) |
+| `npm.containername` | no | `true` | Set to `false` to forward to the container's auto-detected Docker bridge IP instead of its name. Useful when NPMplus uses `network_mode: host` but the target container is on a bridge network |
 
 ### Port auto-detection
 
@@ -104,23 +106,17 @@ The watcher will:
 
 ## Networking
 
-### NPMplus must be able to reach the monitored containers
+### How the forward host is resolved
 
-The `forward_host` written to NPMplus is the **container name** (Docker internal DNS). This means:
+The watcher decides what hostname or IP to write into NPMplus based on container labels. The priority is:
 
-- NPMplus and the target container must share at least one Docker network, **or**
-- You use port mappings (host ports) and NPMplus forwards to the Docker host IP
+1. **`npm.ip=<value>`** — use the value verbatim. Highest priority, overrides everything else.
+2. **`npm.containername=false`** — use the container's Docker bridge IP (auto-detected from `NetworkSettings`).
+3. **Default** — use the Docker container name, resolved via Docker internal DNS.
 
-The recommended setup is to attach both NPMplus and your application containers to a shared Docker network and add that network to the `npm-watcher` service in `docker-compose.yml`.
+### Scenario A — NPMplus on a shared Docker network (default)
 
-### The watcher only needs to reach the socket proxy and NPMplus
-
-The watcher does **not** need to be on the same network as your application containers. It only needs:
-
-1. `watcher-net` — to talk to the socket proxy
-2. A path to the NPMplus API — add the NPMplus network to the `npm-watcher` service if needed
-
-### Example — shared network with NPMplus
+NPMplus and the target containers share a Docker network. Docker DNS resolves container names automatically. No extra labels needed beyond `npm.enable` and `npm.domain`.
 
 ```yaml
 # In your application's docker-compose.yml
@@ -150,6 +146,43 @@ networks:
   proxy:
     external: true
 ```
+
+### Scenario B — NPMplus uses `network_mode: host`, containers on bridge networks
+
+NPMplus runs on the host network stack and cannot use Docker DNS. However, the host always has routes to Docker bridge IPs through `docker0` / `br-xxx` interfaces. Set `npm.containername=false` on each container and the watcher will auto-detect its bridge IP:
+
+```yaml
+services:
+  myapp:
+    image: myimage
+    labels:
+      npm.enable: "true"
+      npm.domain: "app.example.com"
+      npm.containername: "false"   # use bridge IP instead of container name
+```
+
+### Scenario C — Container also uses `network_mode: host`
+
+Both NPMplus and the container are on the host network stack. There is no Docker bridge IP to detect. Use `npm.ip` to point NPMplus at the Docker host's IP and specify the port explicitly:
+
+```yaml
+services:
+  myapp:
+    image: myimage
+    network_mode: host
+    labels:
+      npm.enable: "true"
+      npm.domain: "app.example.com"
+      npm.ip: "192.168.1.10"   # Docker host IP
+      npm.port: "3000"
+```
+
+### The watcher only needs to reach the socket proxy and NPMplus
+
+The watcher does **not** need to be on the same network as your application containers. It only needs:
+
+1. `watcher-net` — to talk to the socket proxy
+2. A path to the NPMplus API — add the NPMplus network to the `npm-watcher` service if needed
 
 ---
 
