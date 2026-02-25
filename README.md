@@ -1,5 +1,8 @@
 # NPMplus Auto Domain
 
+> **AI-generated project notice**
+> This project was built with [Claude AI](https://claude.ai). The code and documentation were written by an AI assistant. Please review all code yourself before running it in any environment you care about — especially anything that touches Docker, networking, or external APIs. Issues and PRs are welcome if you spot problems.
+
 Automatically create and remove [NPMplus](https://github.com/ZoeyVid/NPMplus) proxy hosts by reading Docker container labels. When a labelled container starts, a proxy host is registered in NPMplus. When the container stops, the proxy host is cleaned up.
 
 The watcher connects to Docker through [tecnativa/docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) so the raw Docker socket is never exposed inside the watcher container.
